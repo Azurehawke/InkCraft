@@ -154,8 +154,11 @@ impl Session {
                 .with_title(format!("InkCraft - {}", notebook.title))
                 .with_inner_size(LogicalSize::new(1280.0, 800.0)),
         )?);
+        trace("session: window created");
         let renderer = Renderer::new(event_loop.owned_display_handle(), window.clone())?;
+        trace("session: renderer created");
         let fonts = Fonts::load()?;
+        trace("session: fonts loaded");
 
         let metadata = Metadata::open(&default_data_dir().join("inkcraft.db"))?;
         metadata.register_notebook(&notebook.title, &path, None, unix_now())?;
@@ -225,6 +228,7 @@ impl Session {
             }
         }
         session.relayout();
+        trace("session: ready");
         Ok(session)
     }
 
@@ -1050,6 +1054,7 @@ impl ApplicationHandler for App {
         if self.session.is_some() {
             return;
         }
+        trace("resumed: opening session");
         match Session::open(event_loop, self.path.clone()) {
             Ok(session) => self.session = Some(session),
             Err(e) => {
@@ -1237,12 +1242,29 @@ fn run_headless(args: &Args) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Appends a timestamped line to `startup.log` in the data folder. Used to find where window
+/// startup stops when the process dies without printing anything.
+fn trace(step: &str) {
+    use std::io::Write;
+    let dir = default_data_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("startup.log"))
+    {
+        let _ = writeln!(file, "{} {step}", unix_now());
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
+    trace("main: start");
     let args = parse_args()?;
     if args.import.is_some() || args.export.is_some() || args.template.is_some() || !args.guides.is_empty() {
         return run_headless(&args);
     }
     let event_loop = EventLoop::new()?;
+    trace("main: event loop created");
     let mut app = App::new(args.path);
     event_loop.run_app(&mut app)?;
     Ok(())
