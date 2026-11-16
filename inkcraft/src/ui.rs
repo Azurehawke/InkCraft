@@ -85,9 +85,9 @@ const GUIDE_COLOR: u32 = 0x00a3c4;
 const RULER_BG: u32 = 0xf3f4f6;
 const RULER_INK: u32 = 0x5a5f66;
 
-const REGULAR_FONT: &[u8] = include_bytes!("../assets/fonts/NotoSans-Regular.woff");
-const SEMIBOLD_FONT: &[u8] = include_bytes!("../assets/fonts/NotoSans-SemiBold.woff");
-const ICON_FONT: &[u8] = include_bytes!("../assets/fonts/bootstrap-icons.woff");
+const REGULAR_FONT: &[u8] = include_bytes!("../assets/fonts/NotoSans-Regular.ttf");
+const SEMIBOLD_FONT: &[u8] = include_bytes!("../assets/fonts/NotoSans-SemiBold.ttf");
+const ICON_FONT: &[u8] = include_bytes!("../assets/fonts/bootstrap-icons.ttf");
 
 /// Tabs along the top of the window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
