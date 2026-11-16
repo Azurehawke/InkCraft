@@ -132,8 +132,70 @@ pub struct Notebook {
     pub images: Vec<PageImage>,
     /// Background pattern for the whole canvas.
     pub pattern: Pattern,
-    /// Guide lines the user placed from the rulers, in page units.
+    /// Guide lines the user placed from the rulers, in points.
     pub guides: Vec<Guide>,
+    /// The artboard. `None` is an unbounded canvas with no sheet.
+    pub page: Option<Page>,
+}
+
+/// A standard US paper size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Paper {
+    Letter,
+    Legal,
+    Tabloid,
+}
+
+impl Paper {
+    /// Portrait size in points (72 per inch).
+    pub fn portrait_size(self) -> (f64, f64) {
+        match self {
+            Paper::Letter => (612.0, 792.0),
+            Paper::Legal => (612.0, 1008.0),
+            Paper::Tabloid => (792.0, 1224.0),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Paper::Letter => "Letter",
+            Paper::Legal => "Legal",
+            Paper::Tabloid => "Tabloid",
+        }
+    }
+
+    /// Parses a command-line name such as `letter`.
+    pub fn from_name(name: &str) -> Option<Paper> {
+        match name.to_ascii_lowercase().as_str() {
+            "letter" => Some(Paper::Letter),
+            "legal" => Some(Paper::Legal),
+            "tabloid" => Some(Paper::Tabloid),
+            _ => None,
+        }
+    }
+}
+
+/// The artboard: a sheet of paper in points, starting at the page origin, so the
+/// rulers measure from its upper-left corner.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Page {
+    pub width: f64,
+    pub height: f64,
+}
+
+impl Page {
+    pub fn new(paper: Paper, landscape: bool) -> Page {
+        let (w, h) = paper.portrait_size();
+        if landscape { Page { width: h, height: w } } else { Page { width: w, height: h } }
+    }
+
+    pub fn is_landscape(self) -> bool {
+        self.width > self.height
+    }
+
+    pub fn rect(self) -> Rect {
+        Rect::new([0.0, 0.0], [self.width, self.height])
+    }
 }
 
 /// A guide line: vertical at `x = pos`, or horizontal at `y = pos`, in page units.

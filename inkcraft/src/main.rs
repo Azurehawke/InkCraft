@@ -16,6 +16,7 @@
 //! * Shortcuts: P pen, C pencil, M highlighter, B brush, L line, E eraser, S select, H hand.
 
 use inkcraft::guides;
+use inkcraft::renderer::Backdrop;
 use inkcraft::storage::trace;
 use inkcraft::{
     document::Document,
@@ -23,7 +24,7 @@ use inkcraft::{
         input_channel, pressure_from_force, InputConsumer, InputEvent, InputProducer, Phase,
         PointerSample, StrokeSmoother,
     },
-    model::{Camera, Guide, Notebook, PageImage, Pattern, Rect, Stroke, StrokePoint},
+    model::{Camera, Guide, Notebook, Page, PageImage, Paper, Pattern, Rect, Stroke, StrokePoint},
     renderer::{DrawStroke, FrameInput, OverlayPainter, Renderer, TileKey, TileScheduler},
     storage::{default_data_dir, load_notebook, save_notebook, unix_now, Autosaver, Metadata},
     pdf,
@@ -133,6 +134,7 @@ struct Session {
     guides: Vec<Guide>,
     guide_drag: Option<GuideDrag>,
     guide_preview: Option<Guide>,
+    page: Option<Page>,
 }
 
 impl Session {
@@ -149,6 +151,7 @@ impl Session {
                 images: Vec::new(),
                 pattern: Pattern::Blank,
                 guides: Vec::new(),
+                page: Some(Page::new(Paper::Letter, false)),
             }
         };
 
@@ -183,6 +186,9 @@ impl Session {
             guide_preview: None,
             zoom: 1.0,
             pan: [0.0, 0.0],
+            page: None,
+            paper: None,
+            page_portrait: true,
         };
         let chrome = ui::layout((1, 1), 1.0, &UiState::default(), &placeholder, &fonts);
         let loaded = !notebook.strokes.is_empty();
@@ -199,6 +205,7 @@ impl Session {
             images: notebook.images.iter().cloned().map(Arc::new).collect(),
             pattern: notebook.pattern,
             guides: notebook.guides,
+            page: notebook.page,
             guide_drag: None,
             guide_preview: None,
             doc: Document::new(notebook.strokes),
@@ -279,6 +286,9 @@ impl Session {
             guide_preview: self.guide_preview,
             zoom: self.camera.zoom,
             pan: self.camera.pan,
+            page: self.page.map(page_label),
+            paper: self.page.and_then(paper_of),
+            page_portrait: self.page.is_none_or(|p| !p.is_landscape()),
         }
     }
 
@@ -342,7 +352,7 @@ impl Session {
             }
         }
 
-        if self.pattern != Pattern::Blank {
+        if self.pattern != Pattern::Blank || self.page.is_some() {
             // Empty regions show the pattern too, so request tiles for everything on screen.
             let c = self.chrome.canvas;
             let visible = self.camera.visible_rect([c.w as f64, c.h as f64]);
@@ -353,8 +363,9 @@ impl Session {
 
         let idle = now.duration_since(self.last_edit) >= IDLE_FLUSH;
         if self.tiles.needs_dispatch() && (gesture_ended || self.flush_requested || idle) {
+            let backdrop = self.backdrop();
             self.tiles
-                .dispatch(self.doc.index(), self.doc.strokes(), &self.images, self.pattern);
+                .dispatch(self.doc.index(), self.doc.strokes(), &self.images, backdrop);
             self.flush_requested = false;
         }
 
@@ -709,6 +720,7 @@ impl Session {
             images: self.images.iter().map(|i| (**i).clone()).collect(),
             pattern: self.pattern,
             guides: self.guides.clone(),
+            page: self.page,
         }
     }
 
@@ -755,6 +767,50 @@ impl Session {
         } else {
             self.show_toast("Drop a PDF, PNG, or JPG file to import it");
         }
+    }
+
+    fn backdrop(&self) -> Backdrop {
+        Backdrop { pattern: self.pattern, page: self.page.map(Page::rect) }
+    }
+
+    /// Sets the artboard to a paper size, keeping the current orientation.
+    fn set_paper(&mut self, paper: Option<Paper>) {
+        let landscape = self.page.is_some_and(Page::is_landscape);
+        self.set_page(paper.map(|p| Page::new(p, landscape)));
+    }
+
+    /// Turns the artboard landscape or portrait, keeping its paper size.
+    fn set_landscape(&mut self, landscape: bool) {
+        let Some(page) = self.page else {
+            return;
+        };
+        let (short, long) = (page.width.min(page.height), page.width.max(page.height));
+        let (width, height) = if landscape { (long, short) } else { (short, long) };
+        self.set_page(Some(Page { width, height }));
+    }
+
+    /// Replaces the artboard, centres the view on it, and redraws the tiles.
+    fn set_page(&mut self, page: Option<Page>) {
+        if page == self.page {
+            return;
+        }
+        self.page = page;
+        let label = match page {
+            Some(p) => page_label(p),
+            None => "No page".to_string(),
+        };
+        if let Some(p) = page {
+            let canvas = self.chrome.canvas;
+            self.camera.pan = [
+                p.width / 2.0 - canvas.w as f64 / self.camera.zoom / 2.0,
+                p.height / 2.0 - canvas.h as f64 / self.camera.zoom / 2.0,
+            ];
+        }
+        self.commit_seq += 1;
+        self.tiles.mark_all_dirty(self.commit_seq);
+        self.flush_requested = true;
+        self.edited(Instant::now());
+        self.show_toast(label);
     }
 
     /// Changes the canvas background. Tiles are redrawn, and visible empty areas get tiles.
@@ -806,6 +862,8 @@ impl Session {
             }
             Action::ExportPdf => self.export_pdf(),
             Action::SetPattern(pattern) => self.set_pattern(pattern),
+            Action::SetPaper(paper) => self.set_paper(paper),
+            Action::SetLandscape(landscape) => self.set_landscape(landscape),
             Action::ToggleRulers => self.ui_state.rulers = !self.ui_state.rulers,
             Action::ToggleGuides => self.ui_state.guides_visible = !self.ui_state.guides_visible,
             Action::ToggleSnap => self.ui_state.snap = !self.ui_state.snap,
@@ -820,6 +878,24 @@ impl Session {
 }
 
 /// Builds a rectangle from two corners, in any order.
+/// A page's size for the details panel, such as `8.5 × 11 in, portrait`.
+fn page_label(page: Page) -> String {
+    let orientation = if page.is_landscape() { "landscape" } else { "portrait" };
+    format!(
+        "{} × {} in, {orientation}",
+        guides::format_inches(page.width),
+        guides::format_inches(page.height)
+    )
+}
+
+/// The standard paper size of a page, in either orientation, if it is one.
+fn paper_of(page: Page) -> Option<Paper> {
+    [Paper::Letter, Paper::Legal, Paper::Tabloid].into_iter().find(|paper| {
+        let (w, h) = paper.portrait_size();
+        (page.width, page.height) == (w, h) || (page.width, page.height) == (h, w)
+    })
+}
+
 fn normalize(a: [f64; 2], b: [f64; 2]) -> Rect {
     Rect::new([a[0].min(b[0]), a[1].min(b[1])], [a[0].max(b[0]), a[1].max(b[1])])
 }
@@ -1153,12 +1229,13 @@ impl ApplicationHandler for App {
     }
 }
 
-/// Command-line options. With `--import`, `--export`, or `--template` the program runs without a window.
+/// Command-line options. With `--import`, `--export`, `--template`, `--page` or `--guide` the program runs without a window.
 struct Args {
     path: PathBuf,
     import: Option<PathBuf>,
     export: Option<PathBuf>,
     template: Option<Pattern>,
+    page: Option<Page>,
     guides: Vec<Guide>,
 }
 
@@ -1167,6 +1244,7 @@ fn parse_args() -> Result<Args, String> {
     let mut import = None;
     let mut export = None;
     let mut template = None;
+    let mut page = None;
     let mut guides = Vec::new();
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
@@ -1182,11 +1260,23 @@ fn parse_args() -> Result<Args, String> {
                 let name = name.to_string_lossy().into_owned();
                 template = Some(Pattern::from_name(&name).ok_or(format!("unknown template {name}"))?);
             }
+            Some("--page") => {
+                let spec = args.next().ok_or("--page needs letter, legal or tabloid, optionally ,landscape")?;
+                let spec = spec.to_string_lossy().into_owned();
+                let (name, landscape) = match spec.split_once(',') {
+                    Some((name, "landscape")) => (name, true),
+                    Some(_) => return Err(format!("--page takes ,landscape after the size, got {spec}")),
+                    None => (spec.as_str(), false),
+                };
+                let paper = Paper::from_name(name).ok_or(format!("unknown paper size {name}"))?;
+                page = Some(Page::new(paper, landscape));
+            }
             Some("--guide") => {
-                let spec = args.next().ok_or("--guide needs v:POS or h:POS")?;
+                let spec = args.next().ok_or("--guide needs v:INCHES or h:INCHES")?;
                 let spec = spec.to_string_lossy().into_owned();
                 let (axis, pos) = spec.split_once(':').ok_or(format!("bad guide {spec}"))?;
-                let pos: f64 = pos.parse().map_err(|_| format!("bad guide position in {spec}"))?;
+                let inches: f64 = pos.parse().map_err(|_| format!("bad guide position in {spec}"))?;
+                let pos = inches * guides::POINTS_PER_INCH;
                 let vertical = match axis {
                     "v" => true,
                     "h" => false,
@@ -1203,6 +1293,7 @@ fn parse_args() -> Result<Args, String> {
         import,
         export,
         template,
+        page,
         guides,
     })
 }
@@ -1225,6 +1316,10 @@ fn run_headless(args: &Args) -> Result<(), Box<dyn Error>> {
         notebook.pattern = pattern;
         println!("template: {}", pattern.label());
     }
+    if let Some(page) = args.page {
+        notebook.page = Some(page);
+        println!("page: {}", page_label(page));
+    }
     if !args.guides.is_empty() {
         notebook.guides.extend(args.guides.iter().copied());
         println!("added {} guide(s)", args.guides.len());
@@ -1236,7 +1331,7 @@ fn run_headless(args: &Args) -> Result<(), Box<dyn Error>> {
         println!("imported {} page(s) from {}", pages.len(), file.display());
         notebook.images.extend(pages);
     }
-    if args.template.is_some() || args.import.is_some() || !args.guides.is_empty() {
+    if args.template.is_some() || args.page.is_some() || args.import.is_some() || !args.guides.is_empty() {
         save_notebook(&args.path, &notebook)?;
     }
     if let Some(out) = &args.export {
@@ -1249,7 +1344,7 @@ fn run_headless(args: &Args) -> Result<(), Box<dyn Error>> {
 fn main() -> Result<(), Box<dyn Error>> {
     trace("main: start");
     let args = parse_args()?;
-    if args.import.is_some() || args.export.is_some() || args.template.is_some() || !args.guides.is_empty() {
+    if args.import.is_some() || args.export.is_some() || args.template.is_some() || args.page.is_some() || !args.guides.is_empty() {
         return run_headless(&args);
     }
     let event_loop = EventLoop::new()?;

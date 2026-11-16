@@ -11,7 +11,7 @@ use skia_safe::{
 };
 
 use crate::guides;
-use crate::model::{Guide, Pattern};
+use crate::model::{Guide, Paper, Pattern};
 
 pub const TAB_BAR_H: f32 = 34.0;
 pub const RIBBON_BODY_H: f32 = 96.0;
@@ -76,6 +76,10 @@ const ICON_BLANK: char = '\u{f392}';
 const ICON_RULED: char = '\u{f478}';
 const ICON_GRID_TEMPLATE: char = '\u{f3f9}';
 const ICON_DOTS: char = '\u{f5d4}';
+const ICON_PAGE: char = '\u{f38b}';
+const ICON_PORTRAIT: char = '\u{f4e7}';
+const ICON_LANDSCAPE: char = '\u{f4e4}';
+const ICON_NO_PAGE: char = '\u{f63b}';
 const ICON_RULERS: char = '\u{f523}';
 const ICON_GUIDES: char = '\u{f304}';
 const ICON_MAGNET: char = '\u{f779}';
@@ -177,6 +181,9 @@ pub enum Action {
     Save,
     ExportPdf,
     SetPattern(Pattern),
+    /// `None` removes the artboard.
+    SetPaper(Option<Paper>),
+    SetLandscape(bool),
     ToggleRulers,
     ToggleGuides,
     ToggleSnap,
@@ -230,7 +237,12 @@ pub struct Info {
     pub selection: Vec<PxRect>,
     /// Background pattern of the notebook.
     pub pattern: Pattern,
-    /// Guides in the notebook, in page units.
+    /// The artboard's size in points, and its paper size if it is a standard one.
+    pub page: Option<String>,
+    pub paper: Option<Paper>,
+    /// The artboard is portrait (ignored without one).
+    pub page_portrait: bool,
+    /// Guides in the notebook, in points.
     pub guides: Vec<Guide>,
     /// Guide being dragged out of a ruler, not yet placed.
     pub guide_preview: Option<Guide>,
@@ -588,6 +600,16 @@ fn ribbon_specs(state: &UiState, info: &Info) -> Vec<GroupSpec> {
                 big(Action::ToggleSnap, Glyph::Icon(ICON_MAGNET), "Snap", state.snap, true),
                 big(Action::ClearGuides, Glyph::Icon(ICON_TRASH), "Clear", false, !info.guides.is_empty()),
             ],
+        }, GroupSpec {
+            label: "Page",
+            items: vec![
+                big(Action::SetPaper(Some(Paper::Letter)), Glyph::Icon(ICON_PAGE), "Letter", info.paper == Some(Paper::Letter), true),
+                big(Action::SetPaper(Some(Paper::Legal)), Glyph::Icon(ICON_PAGE), "Legal", info.paper == Some(Paper::Legal), true),
+                big(Action::SetPaper(Some(Paper::Tabloid)), Glyph::Icon(ICON_PAGE), "Tabloid", info.paper == Some(Paper::Tabloid), true),
+                big(Action::SetPaper(None), Glyph::Icon(ICON_NO_PAGE), "No page", info.page.is_none(), true),
+                big(Action::SetLandscape(false), Glyph::Icon(ICON_PORTRAIT), "Portrait", info.page.is_some() && info.page_portrait, info.page.is_some()),
+                big(Action::SetLandscape(true), Glyph::Icon(ICON_LANDSCAPE), "Landscape", info.page.is_some() && !info.page_portrait, info.page.is_some()),
+            ],
         }],
     }
 }
@@ -925,10 +947,6 @@ fn paint_canvas_frame(canvas: &Canvas, c: &Chrome, s: f32) {
     stroke_round(canvas, c.canvas, 0.0, CANVAS_BORDER, 1.0, 1.0 * s);
 }
 
-fn format_tick(v: f64) -> String {
-    (v.round() as i64).to_string()
-}
-
 /// Pale strips with tick marks and labels along the top and left edges of the canvas.
 fn paint_rulers(canvas: &Canvas, c: &Chrome, info: &Info, fonts: &Fonts, s: f32) {
     let font = fonts.text(9.5 * s);
@@ -939,12 +957,12 @@ fn paint_rulers(canvas: &Canvas, c: &Chrome, info: &Info, fonts: &Fonts, s: f32)
         let to = info.pan[0] + c.canvas.w as f64 / info.zoom;
         for v in guides::ticks(from, to, step) {
             let x = (c.canvas.x as f64 + (v - info.pan[0]) * info.zoom) as f32;
-            let labeled = guides::is_labeled(v, step);
+            let labeled = guides::is_labeled(v);
             let len = if labeled { 9.0 * s } else { 4.0 * s };
             let tick = PxRect { x, y: top.y + top.h - len, w: 1.0 * s, h: len };
             fill_round(canvas, tick, 0.0, RULER_INK, 1.0);
             if labeled {
-                draw_text_at(canvas, &format_tick(v), x + 2.0 * s, top.y + 5.0 * s, &font, RULER_INK, 1.0);
+                draw_text_at(canvas, &guides::format_inches(v), x + 2.0 * s, top.y + 5.0 * s, &font, RULER_INK, 1.0);
             }
         }
         let edge = PxRect { x: top.x, y: top.y + top.h - 1.0 * s, w: top.w, h: 1.0 * s };
@@ -956,7 +974,7 @@ fn paint_rulers(canvas: &Canvas, c: &Chrome, info: &Info, fonts: &Fonts, s: f32)
         let to = info.pan[1] + c.canvas.h as f64 / info.zoom;
         for v in guides::ticks(from, to, step) {
             let y = (c.canvas.y as f64 + (v - info.pan[1]) * info.zoom) as f32;
-            let labeled = guides::is_labeled(v, step);
+            let labeled = guides::is_labeled(v);
             let len = if labeled { 9.0 * s } else { 4.0 * s };
             let tick = PxRect { x: left.x + left.w - len, y, w: len, h: 1.0 * s };
             fill_round(canvas, tick, 0.0, RULER_INK, 1.0);
@@ -965,7 +983,7 @@ fn paint_rulers(canvas: &Canvas, c: &Chrome, info: &Info, fonts: &Fonts, s: f32)
                 canvas.save();
                 canvas.translate((left.x + 5.0 * s, y + 2.0 * s));
                 canvas.rotate(-90.0, None);
-                draw_text_at(canvas, &format_tick(v), 0.0, 0.0, &font, RULER_INK, 1.0);
+                draw_text_at(canvas, &guides::format_inches(v), 0.0, 0.0, &font, RULER_INK, 1.0);
                 canvas.restore();
             }
         }
@@ -1063,7 +1081,10 @@ fn paint_details(canvas: &Canvas, c: &Chrome, state: &UiState, info: &Info, font
     y = header(canvas, y, "View");
     y = line(canvas, y, &format!("Zoom {}%", info.zoom_percent), &body, PANEL_TEXT);
     let y = line(canvas, y, &format!("Tool: {}", state.tool.label()), &muted, PANEL_MUTED);
-    line(canvas, y, &format!("Template: {}", info.pattern.label()), &muted, PANEL_MUTED);
+    let y = line(canvas, y, &format!("Template: {}", info.pattern.label()), &muted, PANEL_MUTED);
+    if let Some(page) = &info.page {
+        line(canvas, y, &format!("Page: {page}"), &muted, PANEL_MUTED);
+    }
 }
 
 fn paint_status(canvas: &Canvas, c: &Chrome, info: &Info, fonts: &Fonts, s: f32) {
@@ -1162,6 +1183,9 @@ mod tests {
             guide_preview: None,
             zoom: 1.0,
             pan: [0.0, 0.0],
+            page: None,
+            paper: None,
+            page_portrait: true,
         }
     }
 

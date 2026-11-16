@@ -12,7 +12,7 @@
 //! Writes go to a sibling `.ink.tmp` file that is fsynced and then renamed over
 //! the target, so a crash mid-save leaves the previous file intact.
 
-use crate::model::{Notebook, PageImage, Pattern, Stroke};
+use crate::model::{Guide, Notebook, PageImage, Pattern, Stroke};
 use serde::Deserialize;
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use rusqlite::{params, Connection};
@@ -26,12 +26,13 @@ use std::{
 };
 
 pub const MAGIC: [u8; 4] = *b"INK1";
-pub const FORMAT_VERSION: u16 = 4;
+pub const FORMAT_VERSION: u16 = 5;
 /// Older versions still load: v1 had no page images, v2 had no pattern,
-/// v3 had no guides.
+/// v3 had no guides, v4 had no page.
 const V1: u16 = 1;
 const V2: u16 = 2;
 const V3: u16 = 3;
+const V4: u16 = 4;
 const HEADER_LEN: usize = 4 + 2 + 8;
 
 /// Quiet period after the last edit before an autosave is written.
@@ -115,6 +116,16 @@ struct NotebookV2 {
     images: Vec<PageImage>,
 }
 
+/// The version 4 layout: everything except the page.
+#[derive(Deserialize)]
+struct NotebookV4 {
+    title: String,
+    strokes: Vec<Stroke>,
+    images: Vec<PageImage>,
+    pattern: Pattern,
+    guides: Vec<Guide>,
+}
+
 /// The version 3 layout: page images and pattern, no guides.
 #[derive(Deserialize)]
 struct NotebookV3 {
@@ -164,6 +175,18 @@ pub fn decode_notebook(bytes: &[u8]) -> Result<Notebook, StorageError> {
                 images: old.images,
                 pattern: old.pattern,
                 guides: Vec::new(),
+                page: None,
+            })
+        }
+        V4 => {
+            let (old, _): (NotebookV4, _) = bincode::serde::decode_from_slice(payload, config)?;
+            Ok(Notebook {
+                title: old.title,
+                strokes: old.strokes,
+                images: old.images,
+                pattern: old.pattern,
+                guides: old.guides,
+                page: None,
             })
         }
         FORMAT_VERSION => {
@@ -483,6 +506,7 @@ mod tests {
             images: Vec::new(),
             pattern: crate::model::Pattern::Blank,
             guides: Vec::new(),
+            page: None,
         }
     }
 
@@ -534,6 +558,7 @@ mod tests {
         });
         nb.pattern = crate::model::Pattern::Ruled;
         nb.guides.push(crate::model::Guide { vertical: true, pos: 42.5 });
+        nb.page = Some(crate::model::Page::new(crate::model::Paper::Legal, true));
         let decoded = decode_notebook(&encode_notebook(&nb).unwrap()).unwrap();
         assert_eq!(decoded, nb);
     }
@@ -566,6 +591,38 @@ mod tests {
         let loaded = decode_notebook(&bytes).unwrap();
         assert_eq!(loaded.pattern, Pattern::Grid);
         assert!(loaded.guides.is_empty());
+    }
+
+    #[test]
+    fn loads_version_four_files_without_page() {
+        #[derive(serde::Serialize)]
+        struct V4 {
+            title: String,
+            strokes: Vec<Stroke>,
+            images: Vec<PageImage>,
+            pattern: Pattern,
+            guides: Vec<Guide>,
+        }
+        let payload = bincode::serde::encode_to_vec(
+            &V4 {
+                title: "Four".into(),
+                strokes: Vec::new(),
+                images: Vec::new(),
+                pattern: Pattern::Ruled,
+                guides: vec![Guide { vertical: false, pos: 72.0 }],
+            },
+            bincode::config::standard(),
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC);
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+
+        let loaded = decode_notebook(&bytes).unwrap();
+        assert_eq!(loaded.guides.len(), 1);
+        assert!(loaded.page.is_none());
     }
 
     #[test]

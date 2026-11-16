@@ -205,11 +205,55 @@ pub fn paint_pattern(canvas: &Canvas, region: Rect, pattern: Pattern) {
     }
 }
 
+/// What lies behind the strokes: the pattern, and the artboard sheet if there is one.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Backdrop {
+    pub pattern: Pattern,
+    /// The sheet in page units. `None` means an unbounded canvas.
+    pub page: Option<Rect>,
+}
+
+/// The sheet of an artboard: white paper with VectorCraft's hard drop shadow
+/// on its right and bottom edges (2 pt at 26 alpha, then 1 pt at 52).
+fn paint_paper(canvas: &Canvas, page: Rect) {
+    for (offset, alpha) in [(2.0f32, 26u8), (1.0, 52)] {
+        let mut paint = Paint::default();
+        paint.set_anti_alias(true);
+        paint.set_color(Color::from_argb(alpha, 0, 0, 0));
+        let rect = skia_safe::Rect::from_ltrb(
+            page.min[0] as f32 + offset,
+            page.min[1] as f32 + offset,
+            page.max[0] as f32 + offset,
+            page.max[1] as f32 + offset,
+        );
+        canvas.draw_rect(rect, &paint);
+    }
+    let mut paint = Paint::default();
+    paint.set_anti_alias(true);
+    paint.set_color(Color::WHITE);
+    canvas.draw_rect(
+        skia_safe::Rect::from_ltrb(
+            page.min[0] as f32,
+            page.min[1] as f32,
+            page.max[0] as f32,
+            page.max[1] as f32,
+        ),
+        &paint,
+    );
+}
+
+/// The overlap of two rectangles, if they share any area.
+fn intersect(a: Rect, b: Rect) -> Option<Rect> {
+    let min = [a.min[0].max(b.min[0]), a.min[1].max(b.min[1])];
+    let max = [a.max[0].min(b.max[0]), a.max[1].min(b.max[1])];
+    (min[0] < max[0] && min[1] < max[1]).then(|| Rect::new(min, max))
+}
+
 pub fn rasterize_tile(
     origin: [f64; 2],
     strokes: &[DrawStroke],
     images: &[Arc<PageImage>],
-    pattern: Pattern,
+    backdrop: Backdrop,
 ) -> Option<Vec<u8>> {
     let info = tile_image_info();
     let mut surface = surfaces::raster(&info, None, None)?;
@@ -218,7 +262,17 @@ pub fn rasterize_tile(
         canvas.clear(Color::TRANSPARENT);
         canvas.translate((-origin[0] as f32, -origin[1] as f32));
         let region = Rect::new(origin, [origin[0] + TILE_SIZE as f64, origin[1] + TILE_SIZE as f64]);
-        paint_pattern(canvas, region, pattern);
+        if let Some(page) = backdrop.page {
+            paint_paper(canvas, page);
+        }
+        // The pattern covers the sheet only, or the whole canvas when there is no sheet.
+        let area = match backdrop.page {
+            None => Some(region),
+            Some(page) => intersect(region, page),
+        };
+        if let Some(area) = area {
+            paint_pattern(canvas, area, backdrop.pattern);
+        }
         for image in images {
             if let Some(decoded) = skia_safe::Image::from_encoded(skia_safe::Data::new_copy(&image.data)) {
                 let r = image.rect;
@@ -288,7 +342,7 @@ struct RasterJob {
     seq: u64,
     strokes: Vec<Stroke>,
     images: Vec<Arc<PageImage>>,
-    pattern: Pattern,
+    backdrop: Backdrop,
 }
 
 struct RasterResult {
@@ -330,7 +384,7 @@ impl TileScheduler {
             .spawn(move || {
                 for job in job_rx {
                     let draw: Vec<DrawStroke> = job.strokes.iter().map(DrawStroke::from_stroke).collect();
-                    let pixels = rasterize_tile(job.key.origin(), &draw, &job.images, job.pattern).unwrap_or_else(|| {
+                    let pixels = rasterize_tile(job.key.origin(), &draw, &job.images, job.backdrop).unwrap_or_else(|| {
                         eprintln!("skia failed to rasterize tile {:?}", job.key);
                         vec![0u8; TILE_BYTES]
                     });
@@ -399,7 +453,7 @@ impl TileScheduler {
         index: &StrokeIndex,
         strokes: &[Stroke],
         images: &[Arc<PageImage>],
-        pattern: Pattern,
+        backdrop: Backdrop,
     ) {
         for (&key, state) in self.states.iter_mut() {
             if !state.dirty || state.in_flight {
@@ -419,7 +473,7 @@ impl TileScheduler {
                 seq: state.requested_seq,
                 strokes: batch,
                 images: page_images,
-                pattern,
+                backdrop,
             };
             if self.jobs.send(job).is_ok() {
                 state.dirty = false;
@@ -899,7 +953,7 @@ mod tests {
     fn tile_rasterization_paints_inside_tile_only() {
         // A line at page (600, 100)..(700, 100) lies in tile (1, 0), which starts at x=512.
         let origin = TileKey { x: 1, y: 0 }.origin();
-        let pixels = rasterize_tile(origin, &[red_line((600.0, 100.0), (700.0, 100.0))], &[], Pattern::Blank).unwrap();
+        let pixels = rasterize_tile(origin, &[red_line((600.0, 100.0), (700.0, 100.0))], &[], Backdrop::default()).unwrap();
         assert_eq!(pixels.len(), TILE_BYTES);
         assert_eq!(alpha_at(&pixels, 100, 100), 255, "ink on the line");
         assert_eq!(alpha_at(&pixels, 10, 10), 0, "far from the line");
@@ -936,7 +990,7 @@ mod tests {
 
         sched.mark_dirty(key, 3);
         assert!(sched.needs_dispatch());
-        sched.dispatch(&index, &strokes, &[], Pattern::Blank);
+        sched.dispatch(&index, &strokes, &[], Backdrop::default());
         assert!(!sched.needs_dispatch());
         assert!(sched.is_busy());
 
@@ -959,11 +1013,28 @@ mod pattern_tests {
 
     #[test]
     fn ruled_tile_has_lines_and_blank_does_not() {
-        let blank = rasterize_tile([0.0, 0.0], &[], &[], Pattern::Blank).unwrap();
-        let ruled = rasterize_tile([0.0, 0.0], &[], &[], Pattern::Ruled).unwrap();
+        let blank = rasterize_tile([0.0, 0.0], &[], &[], Backdrop::default()).unwrap();
+        let ruled = rasterize_tile(
+            [0.0, 0.0],
+            &[],
+            &[],
+            Backdrop { pattern: Pattern::Ruled, page: None },
+        )
+        .unwrap();
         let alpha = |px: &[u8], x: usize, y: usize| px[(y * TILE_SIZE as usize + x) * 4 + 3];
         assert_eq!(alpha(&blank, 100, 26), 0);
         assert!(alpha(&ruled, 100, 26) > 0, "line at y = 26 should be drawn");
         assert_eq!(alpha(&ruled, 100, 10), 0, "no line between rules");
+    }
+
+    #[test]
+    fn paper_is_white_inside_the_sheet_and_clear_outside() {
+        let letter = crate::model::Page::new(crate::model::Paper::Letter, false).rect();
+        let backdrop = Backdrop { pattern: Pattern::Blank, page: Some(letter) };
+        let pixel = |px: &[u8], x: usize, y: usize| px[(y * TILE_SIZE as usize + x) * 4..][..4].to_vec();
+        let inside = rasterize_tile([0.0, 0.0], &[], &[], backdrop).unwrap();
+        assert_eq!(pixel(&inside, 100, 100), vec![255, 255, 255, 255]);
+        let outside = rasterize_tile([1024.0, 1024.0], &[], &[], backdrop).unwrap();
+        assert_eq!(pixel(&outside, 10, 10)[3], 0);
     }
 }

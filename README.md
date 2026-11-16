@@ -51,7 +51,7 @@ cursor. Pan and zoom are ignored while a stroke is in progress.
 `INK1` magic, `u16` format version, `u64` payload length, then a
 bincode 2 (standard config) body. Saves write `*.ink.tmp`, fsync, then rename.
 
-Version 4 (current) adds `guides`, the guide lines. Version 3 adds `pattern`,
+Version 5 (current) adds `page`, the artboard size. Version 4 adds `guides`, the guide lines. Version 3 adds `pattern`,
 the background template (blank, ruled, grid, dots). Version 2 adds `images`,
 the imported pages. Each entry is a page
 rectangle plus its PNG bytes. Versions 1 to 3 still load. The migration is
@@ -226,8 +226,22 @@ spacing follows the zoom level.
 
 Guides are saved with the notebook but are never exported to PDF.
 
-Command line: `--guide v:120` adds a vertical guide at x = 120, and
-`--guide h:200` adds a horizontal guide at y = 200. These can be repeated.
+Command line: `--guide v:2` adds a vertical guide at 2 in, and
+`--guide h:3.5` adds a horizontal guide at 3.5 in. These can be repeated.
+
+## Page sizes
+
+The artboard is a white sheet with a hard drop shadow on a grey pasteboard,
+the way VectorCraft draws its artboards. The sheet starts at the upper-left
+corner, which is where the rulers start at zero. Sizes are Letter (8.5 × 11 in),
+Legal (8.5 × 14 in) and Tabloid (11 × 17 in), in portrait or landscape. A
+new notebook starts as Letter portrait; "No page" removes the sheet and leaves an
+unbounded canvas.
+
+Rulers are measured in inches. Coordinates are still stored in points (72 per
+inch). Command line: `--page letter`, `--page legal,landscape` or `--page tabloid`.
+
+Not yet done: PDF export still uses the imported pages' sizes, not the artboard.
 
 Limits:
 
