@@ -1,3 +1,5 @@
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
 //! InkCraft entry point: winit event loop, input routing, and the frame loop.
 //!
 //! Usage: `inkcraft [NOTEBOOK.ink]`. Without an argument the notebook is
@@ -1060,6 +1062,7 @@ impl ApplicationHandler for App {
             Ok(session) => self.session = Some(session),
             Err(e) => {
                 eprintln!("failed to start InkCraft: {e}");
+                trace(&format!("error: failed to start: {e}"));
                 event_loop.exit();
             }
         }
@@ -1252,6 +1255,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new()?;
     trace("main: event loop created");
     let mut app = App::new(args.path);
-    event_loop.run_app(&mut app)?;
+    if let Err(e) = event_loop.run_app(&mut app) {
+        trace(&format!("error: event loop: {e}"));
+        return Err(e.into());
+    }
     Ok(())
 }
