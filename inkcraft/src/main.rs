@@ -24,7 +24,7 @@ use inkcraft::{
         input_channel, pressure_from_force, InputConsumer, InputEvent, InputProducer, Phase,
         PointerSample, StrokeSmoother,
     },
-    model::{Camera, Guide, Notebook, Page, PageImage, Paper, Pattern, Rect, Stroke, StrokePoint},
+    model::{Camera, Guide, Notebook, Page, Paper, Pattern, Rect, Stroke, StrokePoint},
     renderer::{DrawStroke, FrameInput, OverlayPainter, Renderer, TileKey, TileScheduler},
     storage::{default_data_dir, load_notebook, save_notebook, unix_now, Autosaver, Metadata},
     pdf,
@@ -74,6 +74,77 @@ enum Gesture {
     /// Strokes hit so far. Removal happens on release, as one undoable edit.
     Erase { hits: BTreeSet<usize> },
     Select { start: [f64; 2], end: [f64; 2] },
+    /// Moving (`grip` is (0, 0)) or scaling image `index`. `original` is its rect when the drag
+    /// began and `current` its rect now; the image is already at `current`.
+    Image { index: usize, grip: (i8, i8), start: [f64; 2], original: Rect, current: Rect },
+}
+
+/// Screen distance within which a pointer grabs a corner or edge handle of a selected image.
+const GRIP_PX: f64 = 6.0;
+/// Smallest width or height an image can be scaled to, in points.
+const MIN_IMAGE_SIZE: f64 = 8.0;
+
+/// Handle positions of an image: each `(x, y)` is -1 (min), 0 (middle) or 1 (max) on each axis.
+fn image_grips(rect: Rect) -> Vec<((i8, i8), [f64; 2])> {
+    let mut grips = Vec::new();
+    for x in -1..=1i8 {
+        for y in -1..=1i8 {
+            if (x, y) == (0, 0) {
+                continue;
+            }
+            let at = |axis: usize, g: i8| match g {
+                -1 => rect.min[axis],
+                1 => rect.max[axis],
+                _ => (rect.min[axis] + rect.max[axis]) / 2.0,
+            };
+            grips.push(((x, y), [at(0, x), at(1, y)]));
+        }
+    }
+    grips
+}
+
+/// The rect an image takes when its grip is dragged to `p`. Corners keep the image's shape;
+/// edges change one side only. The side opposite the grip stays where it is.
+fn scaled_rect(original: Rect, grip: (i8, i8), p: [f64; 2]) -> Rect {
+    let mut lens = [0.0f64; 2];
+    let mut anchors = [0.0f64; 2];
+    for axis in 0..2 {
+        let g = if axis == 0 { grip.0 } else { grip.1 };
+        let extent = original.max[axis] - original.min[axis];
+        if g == 0 {
+            anchors[axis] = original.min[axis];
+            lens[axis] = extent;
+        } else {
+            anchors[axis] = if g < 0 { original.max[axis] } else { original.min[axis] };
+            lens[axis] = (p[axis] - anchors[axis]).abs().max(MIN_IMAGE_SIZE);
+        }
+    }
+    if grip.0 != 0 && grip.1 != 0 {
+        // A corner keeps the aspect ratio of the image, using the larger of the two scales.
+        let (w, h) = (original.max[0] - original.min[0], original.max[1] - original.min[1]);
+        let scale = (lens[0] / w).max(lens[1] / h);
+        lens = [w * scale, h * scale];
+    }
+    let mut min = [0.0f64; 2];
+    let mut max = [0.0f64; 2];
+    for axis in 0..2 {
+        let g = if axis == 0 { grip.0 } else { grip.1 };
+        if g == 0 {
+            min[axis] = original.min[axis];
+            max[axis] = original.max[axis];
+        } else if g < 0 {
+            min[axis] = anchors[axis] - lens[axis];
+            max[axis] = anchors[axis];
+        } else {
+            min[axis] = anchors[axis];
+            max[axis] = anchors[axis] + lens[axis];
+        }
+    }
+    Rect::new(min, max)
+}
+
+fn contains(rect: Rect, p: [f64; 2]) -> bool {
+    p[0] >= rect.min[0] && p[0] <= rect.max[0] && p[1] >= rect.min[1] && p[1] <= rect.max[1]
 }
 
 /// A guide being placed from a ruler, or an existing guide being moved.
@@ -117,9 +188,10 @@ struct Session {
     toast: Option<(String, Instant)>,
     title: String,
     doc: Document,
-    images: Vec<Arc<PageImage>>,
     pattern: Pattern,
     selection: Vec<usize>,
+    /// The image selected with the Select tool, if any: moved and scaled by its handles.
+    image_selected: Option<usize>,
     commit_seq: u64,
     live: Vec<LiveStroke>,
     gesture: Gesture,
@@ -170,6 +242,7 @@ impl Session {
         metadata.register_notebook(&notebook.title, &path, None, unix_now())?;
 
         let placeholder = Info {
+            grips: Vec::new(),
             title: String::new(),
             file_name: String::new(),
             stroke_count: 0,
@@ -202,13 +275,13 @@ impl Session {
             painted: None,
             toast: None,
             title: notebook.title.clone(),
-            images: notebook.images.iter().cloned().map(Arc::new).collect(),
             pattern: notebook.pattern,
             guides: notebook.guides,
             page: notebook.page,
             guide_drag: None,
             guide_preview: None,
-            doc: Document::new(notebook.strokes),
+            doc: Document::with_images(notebook.strokes, notebook.images),
+            image_selected: None,
             selection: Vec::new(),
             commit_seq: if loaded { 1 } else { 0 },
             live: Vec::new(),
@@ -232,7 +305,7 @@ impl Session {
                 session.tiles.mark_dirty(key, seq);
             }
         }
-        for image in &session.images {
+        for image in session.doc.images() {
             for key in TileKey::covering(image.rect) {
                 session.tiles.mark_dirty(key, seq);
             }
@@ -258,14 +331,29 @@ impl Session {
             Gesture::Select { start, end } => Some(to_window(normalize(start, end))),
             _ => None,
         };
-        let selection = self
+        let mut selection: Vec<PxRect> = self
             .selection
             .iter()
             .map(|&id| to_window(self.doc.strokes()[id].bounds()))
             .collect();
+        let mut grips = Vec::new();
+        if let Some(rect) = self.image_selected.and_then(|i| self.doc.images().get(i)).map(|im| im.rect) {
+            selection.push(to_window(rect));
+            for (_, at) in image_grips(rect) {
+                let c = self.camera.page_to_screen(at);
+                let half = (GRIP_PX as f32) * self.chrome.scale;
+                grips.push(PxRect {
+                    x: canvas.x + c[0] as f32 - half,
+                    y: canvas.y + c[1] as f32 - half,
+                    w: 2.0 * half,
+                    h: 2.0 * half,
+                });
+            }
+        }
         let idle = matches!(self.gesture, Gesture::None);
 
         Info {
+            grips,
             title: self.title.clone(),
             file_name: self
                 .path
@@ -365,7 +453,7 @@ impl Session {
         if self.tiles.needs_dispatch() && (gesture_ended || self.flush_requested || idle) {
             let backdrop = self.backdrop();
             self.tiles
-                .dispatch(self.doc.index(), self.doc.strokes(), &self.images, backdrop);
+                .dispatch(self.doc.index(), self.doc.strokes(), self.doc.images(), backdrop);
             self.flush_requested = false;
         }
 
@@ -427,7 +515,7 @@ impl Session {
                     overlay_strokes.push(preview);
                 }
             }
-            Gesture::Select { .. } | Gesture::None => {}
+            Gesture::Select { .. } | Gesture::Image { .. } | Gesture::None => {}
         }
         let overlay = if overlay_strokes.is_empty() || cw == 0 || ch == 0 {
             None
@@ -484,7 +572,7 @@ impl Session {
                             hits.extend(self.doc.hit(page, r));
                             Gesture::Erase { hits }
                         }
-                        Tool::Select => Gesture::Select { start: page, end: page },
+                        Tool::Select => self.begin_select(page),
                         _ => Gesture::None,
                     }
                 };
@@ -501,7 +589,54 @@ impl Session {
         }
     }
 
+    /// What a press with the Select tool at `page` starts. A handle or the body of the selected
+    /// image comes first, then strokes, then any image under the pointer, else a marquee.
+    fn begin_select(&mut self, page: [f64; 2]) -> Gesture {
+        if let Some(index) = self.image_selected {
+            if let Some(rect) = self.doc.images().get(index).map(|im| im.rect) {
+                let tol = self.page_radius(GRIP_PX);
+                let grip = image_grips(rect).into_iter().find_map(|(g, at)| {
+                    ((page[0] - at[0]).abs() <= tol && (page[1] - at[1]).abs() <= tol).then_some(g)
+                });
+                if let Some(grip) = grip {
+                    return Gesture::Image { index, grip, start: page, original: rect, current: rect };
+                }
+                if contains(rect, page) {
+                    return Gesture::Image { index, grip: (0, 0), start: page, original: rect, current: rect };
+                }
+            }
+        }
+        if !self.doc.hit(page, self.page_radius(CLICK_SELECT_RADIUS)).is_empty() {
+            self.image_selected = None;
+            return Gesture::Select { start: page, end: page };
+        }
+        let under = self.doc.images().iter().rposition(|im| contains(im.rect, page));
+        if let Some(index) = under {
+            let rect = self.doc.images()[index].rect;
+            self.image_selected = Some(index);
+            self.selection.clear();
+            return Gesture::Image { index, grip: (0, 0), start: page, original: rect, current: rect };
+        }
+        self.image_selected = None;
+        Gesture::Select { start: page, end: page }
+    }
+
     fn update_gesture(&mut self, point: StrokePoint, page: [f64; 2], now: Instant) {
+        if let Gesture::Image { index, grip, start, original, .. } = self.gesture {
+            let rect = if grip == (0, 0) {
+                let (dx, dy) = (page[0] - start[0], page[1] - start[1]);
+                Rect::new([original.min[0] + dx, original.min[1] + dy], [original.max[0] + dx, original.max[1] + dy])
+            } else {
+                scaled_rect(original, grip, page)
+            };
+            if let Gesture::Image { current, .. } = &mut self.gesture {
+                *current = rect;
+            }
+            self.doc.preview_image(index, rect);
+            self.sync_tiles();
+            self.last_edit = now;
+            return;
+        }
         let radius = self.page_radius(ERASER_RADIUS);
         match &mut self.gesture {
             Gesture::Ink { smoother, .. } => {
@@ -512,7 +647,7 @@ impl Session {
             Gesture::Line { end, .. } => *end = point,
             Gesture::Erase { hits } => hits.extend(self.doc.hit(page, radius)),
             Gesture::Select { end, .. } => *end = page,
-            Gesture::None => {}
+            Gesture::Image { .. } | Gesture::None => {}
         }
     }
 
@@ -550,6 +685,14 @@ impl Session {
             Gesture::Select { start, end } => {
                 self.select(start, end);
                 false
+            }
+            Gesture::Image { index, original, current, .. } => {
+                let moved = original != current;
+                self.doc.commit_image_move(index, original, current);
+                if moved {
+                    self.edited(now);
+                }
+                moved
             }
         }
     }
@@ -591,6 +734,7 @@ impl Session {
     fn after_history(&mut self, now: Instant) {
         self.live.clear();
         self.selection.clear();
+        self.image_selected = None;
         self.sync_tiles();
         self.edited(now);
     }
@@ -697,7 +841,15 @@ impl Session {
     }
 
     fn delete_selection(&mut self) {
-        if matches!(self.gesture, Gesture::None) && !self.selection.is_empty() {
+        if !matches!(self.gesture, Gesture::None) {
+            return;
+        }
+        if let Some(index) = self.image_selected.take() {
+            self.doc.remove_image(index);
+            self.after_history(Instant::now());
+            return;
+        }
+        if !self.selection.is_empty() {
             let ids = std::mem::take(&mut self.selection);
             self.doc.erase(&ids);
             self.after_history(Instant::now());
@@ -717,7 +869,7 @@ impl Session {
         Notebook {
             title: self.title.clone(),
             strokes: self.doc.strokes().to_vec(),
-            images: self.images.iter().map(|i| (**i).clone()).collect(),
+            images: self.doc.images().iter().map(|i| (**i).clone()).collect(),
             pattern: self.pattern,
             guides: self.guides.clone(),
             page: self.page,
@@ -731,7 +883,8 @@ impl Session {
     /// Imports every page of a PDF below the existing content. Not undoable.
     fn import_pdf(&mut self, path: &Path, now: Instant) {
         let bottom = self
-            .images
+            .doc
+            .images()
             .iter()
             .map(|i| i.rect.max[1])
             .chain(self.doc.strokes().iter().map(|s| s.bounds().max[1]))
@@ -742,16 +895,12 @@ impl Session {
         match result {
             Ok(pages) => {
                 let count = pages.len();
-                let first_new = self.images.len();
-                self.images.extend(pages.into_iter().map(Arc::new));
-                self.commit_seq += 1;
-                let seq = self.commit_seq;
-                for image in &self.images[first_new..] {
-                    for key in TileKey::covering(image.rect) {
-                        self.tiles.mark_dirty(key, seq);
-                    }
-                }
-                self.flush_requested = true;
+                let first_new = self.doc.images().len();
+                self.doc.add_images(pages);
+                self.sync_tiles();
+                // The first imported page is selected, ready to move or scale.
+                self.selection.clear();
+                self.image_selected = Some(first_new);
                 self.edited(now);
                 self.show_toast(format!("Imported {count} page(s)"));
             }
@@ -1097,6 +1246,7 @@ impl App {
             Key::Named(NamedKey::Escape) => {
                 if let Some(session) = self.session.as_mut() {
                     session.selection.clear();
+                    session.image_selected = None;
                 }
                 None
             }
@@ -1358,4 +1508,32 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(e.into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod scaling_tests {
+    use super::*;
+
+    #[test]
+    fn corner_scaling_keeps_the_aspect_ratio() {
+        let r = Rect::new([0.0, 0.0], [200.0, 100.0]);
+        // Drag the bottom-right corner to (300, 120): the larger scale wins, so 2x in width.
+        let out = scaled_rect(r, (1, 1), [300.0, 120.0]);
+        assert_eq!((out.min, out.max), ([0.0, 0.0], [300.0, 150.0]));
+        // Dragging the top-left corner moves that side and keeps the bottom-right in place.
+        let out = scaled_rect(r, (-1, -1), [-100.0, -50.0]);
+        assert_eq!(out.max, [200.0, 100.0]);
+        assert_eq!(out.min, [-100.0, -50.0]);
+    }
+
+    #[test]
+    fn edge_scaling_changes_one_side_and_has_a_minimum() {
+        let r = Rect::new([10.0, 10.0], [110.0, 60.0]);
+        let out = scaled_rect(r, (1, 0), [250.0, 999.0]);
+        assert_eq!((out.min, out.max), ([10.0, 10.0], [250.0, 60.0]));
+        // Dragged past the anchor, the width would be negative: it stops at the minimum.
+        let out = scaled_rect(r, (-1, 0), [105.0, 0.0]);
+        assert_eq!(out.min[0], 110.0 - MIN_IMAGE_SIZE);
+        assert_eq!(out.max, [110.0, 60.0]);
+    }
 }

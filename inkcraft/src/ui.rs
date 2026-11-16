@@ -221,6 +221,8 @@ impl Default for UiState {
 /// Read-only facts shown in the status bar and details panel.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Info {
+    /// Handles of the selected image, in window pixels.
+    pub grips: Vec<PxRect>,
     pub title: String,
     pub file_name: String,
     pub stroke_count: usize,
@@ -1020,6 +1022,10 @@ fn paint_selection(canvas: &Canvas, info: &Info, s: f32) {
     for rect in &info.selection {
         stroke_round(canvas, *rect, 0.0, BRAND, 1.0, 1.0 * s);
     }
+    for grip in &info.grips {
+        fill_round(canvas, *grip, 0.0, 0xffffff, 1.0);
+        stroke_round(canvas, *grip, 0.0, BRAND, 1.0, 1.0 * s);
+    }
     if let Some(marquee) = info.marquee {
         fill_round(canvas, marquee, 0.0, BRAND, 0.08);
         stroke_round(canvas, marquee, 0.0, BRAND, 1.0, 1.0 * s);
@@ -1167,6 +1173,7 @@ mod tests {
 
     fn info(can_undo: bool) -> Info {
         Info {
+            grips: Vec::new(),
             title: "Floor plan".into(),
             file_name: "Floor plan.ink".into(),
             stroke_count: 12,

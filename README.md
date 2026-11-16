@@ -241,6 +241,11 @@ unbounded canvas.
 Rulers are measured in inches. Coordinates are still stored in points (72 per
 inch). Command line: `--page letter`, `--page legal,landscape` or `--page tabloid`.
 
+Imports are objects, not fixed pages. An imported page or template is selected
+by clicking it with the Select tool. Drag it to move it, or drag one of its eight
+handles to scale it (corners keep its shape). Delete removes it, and the moves,
+scalings, removals and imports are all undoable. A new import is selected.
+
 PDF export: with an artboard, the first PDF page is exactly the artboard size.
 Imported pages on the sheet are drawn on it, and other imports and strokes get
 their own pages. Import: PDF pages and PNG/JPG templates are scaled to fit the

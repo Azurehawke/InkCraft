@@ -5,7 +5,9 @@
 //! positions in [`Document::strokes`]; they shift whenever strokes are removed
 //! or restored, so callers must not hold ids across an edit.
 
-use crate::model::{Rect, Stroke, StrokePoint};
+use std::sync::Arc;
+
+use crate::model::{PageImage, Rect, Stroke, StrokePoint};
 use crate::spatial::StrokeIndex;
 
 /// Strokes can extend this far beyond their points (half the widest nib).
@@ -18,10 +20,18 @@ enum Edit {
     Insert(Vec<(usize, Stroke)>),
     /// Take the strokes at these ids out. The ids are the positions before removal.
     Remove(Vec<(usize, Stroke)>),
+    /// Put these images back at these ids, in ascending id order.
+    AddImages(Vec<(usize, Arc<PageImage>)>),
+    /// Take the images at these ids out, as [`Edit::Remove`] does for strokes.
+    RemoveImages(Vec<(usize, Arc<PageImage>)>),
+    /// Move image `index` from `from` to `to`.
+    MoveImage { index: usize, from: Rect, to: Rect },
 }
 
 pub struct Document {
     strokes: Vec<Stroke>,
+    /// Imported pages and templates, drawn under the strokes. Each can be moved and scaled.
+    images: Vec<Arc<PageImage>>,
     index: StrokeIndex,
     undo: Vec<Edit>,
     redo: Vec<Edit>,
@@ -31,9 +41,15 @@ pub struct Document {
 
 impl Document {
     pub fn new(strokes: Vec<Stroke>) -> Self {
+        Self::with_images(strokes, Vec::new())
+    }
+
+    pub fn with_images(strokes: Vec<Stroke>, images: Vec<PageImage>) -> Self {
+        let images = images.into_iter().map(Arc::new).collect();
         let index = StrokeIndex::from_strokes(&strokes);
         Self {
             strokes,
+            images,
             index,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -47,6 +63,46 @@ impl Document {
 
     pub fn index(&self) -> &StrokeIndex {
         &self.index
+    }
+
+    pub fn images(&self) -> &[Arc<PageImage>] {
+        &self.images
+    }
+
+    /// Appends imported images as one undoable edit.
+    pub fn add_images(&mut self, images: Vec<PageImage>) {
+        if images.is_empty() {
+            return;
+        }
+        let first = self.images.len();
+        let items = images.into_iter().enumerate().map(|(i, im)| (first + i, Arc::new(im))).collect();
+        self.apply(Edit::AddImages(items));
+    }
+
+    /// Removes image `index` as one undoable edit.
+    pub fn remove_image(&mut self, index: usize) {
+        if let Some(image) = self.images.get(index).cloned() {
+            self.apply(Edit::RemoveImages(vec![(index, image)]));
+        }
+    }
+
+    /// Moves image `index` to `rect` while a drag is under way, without an undo step.
+    /// [`Document::commit_image_move`] records the whole drag once it ends.
+    pub fn preview_image(&mut self, index: usize, rect: Rect) {
+        if let Some(image) = self.images.get_mut(index) {
+            self.dirty.push(image.rect);
+            self.dirty.push(rect);
+            Arc::make_mut(image).rect = rect;
+        }
+    }
+
+    /// Records a finished drag of image `index` from `from` to `to` as one undo step. The
+    /// image is already at `to` (see [`Document::preview_image`]).
+    pub fn commit_image_move(&mut self, index: usize, from: Rect, to: Rect) {
+        if from != to && index < self.images.len() {
+            self.undo.push(Edit::MoveImage { index, from: to, to: from });
+            self.redo.clear();
+        }
     }
 
     /// Appends a stroke as a new undoable edit. Returns its id.
@@ -160,6 +216,28 @@ impl Document {
                 self.reindex();
                 Edit::Insert(items)
             }
+            Edit::AddImages(items) => {
+                for (id, image) in &items {
+                    self.dirty.push(image.rect);
+                    self.images.insert(*id, image.clone());
+                }
+                Edit::RemoveImages(items)
+            }
+            Edit::RemoveImages(items) => {
+                for (id, _) in items.iter().rev() {
+                    let image = self.images.remove(*id);
+                    self.dirty.push(image.rect);
+                }
+                Edit::AddImages(items)
+            }
+            Edit::MoveImage { index, from, to } => {
+                if let Some(image) = self.images.get_mut(index) {
+                    self.dirty.push(image.rect);
+                    self.dirty.push(to);
+                    Arc::make_mut(image).rect = to;
+                }
+                Edit::MoveImage { index, from: to, to: from }
+            }
         }
     }
 
@@ -268,5 +346,32 @@ mod tests {
         doc.commit(line(0.0, 0.0, 5.0, 5.0));
         assert_eq!(doc.take_dirty().len(), 1);
         assert!(doc.take_dirty().is_empty());
+    }
+
+    #[test]
+    fn image_moves_and_imports_undo_and_redo() {
+        let page = |y: f64| PageImage { rect: Rect::new([0.0, y], [100.0, y + 50.0]), data: vec![1] };
+        let mut doc = Document::with_images(vec![], vec![page(0.0)]);
+        doc.add_images(vec![page(100.0)]);
+        assert_eq!(doc.images().len(), 2);
+
+        let from = doc.images()[0].rect;
+        let to = Rect::new([10.0, 10.0], [210.0, 110.0]);
+        doc.preview_image(0, to);
+        doc.commit_image_move(0, from, to);
+        assert_eq!(doc.images()[0].rect, to);
+
+        assert!(doc.undo());
+        assert_eq!(doc.images()[0].rect, from);
+        assert!(doc.redo());
+        assert_eq!(doc.images()[0].rect, to);
+
+        assert!(doc.undo());
+        assert!(doc.undo());
+        assert_eq!(doc.images().len(), 1);
+        doc.remove_image(0);
+        assert!(doc.images().is_empty());
+        assert!(doc.undo());
+        assert_eq!(doc.images().len(), 1);
     }
 }
