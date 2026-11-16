@@ -491,9 +491,13 @@ pub struct Renderer {
 impl Renderer {
     pub fn new(display: OwnedDisplayHandle, window: Arc<Window>) -> Result<Self, Box<dyn Error>> {
         // `_from_env` lets WGPU_BACKEND pick a backend (dx12, vulkan, gl) for testing.
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(
-            Box::new(display),
-        ));
+        let mut descriptor =
+            wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(display));
+        if cfg!(target_os = "windows") && std::env::var_os("WGPU_BACKEND").is_none() {
+            // On the test machine a Vulkan driver crashed while creating the device; DirectX 12 works.
+            descriptor.backends = wgpu::Backends::DX12;
+        }
+        let instance = wgpu::Instance::new(descriptor);
         crate::storage::trace("renderer: instance created");
         let surface = instance.create_surface(window.clone())?;
         crate::storage::trace("renderer: surface created");
