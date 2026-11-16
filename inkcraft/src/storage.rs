@@ -430,6 +430,24 @@ pub fn unix_now() -> i64 {
 }
 
 /// Directory for notebooks and the metadata database. Honours `INKCRAFT_HOME`.
+/// Appends a timestamped line to `startup.log` in the data folder. Used to find where window
+/// startup stops when the process dies without printing anything.
+pub fn trace(step: &str) {
+    use std::io::Write;
+    let dir = default_data_dir();
+    let _ = fs::create_dir_all(&dir);
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("startup.log"))
+    {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let _ = writeln!(file, "{timestamp} {step}");
+    }
+}
+
 pub fn default_data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("INKCRAFT_HOME") {
         return PathBuf::from(dir);

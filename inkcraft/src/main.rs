@@ -14,6 +14,7 @@
 //! * Shortcuts: P pen, C pencil, M highlighter, B brush, L line, E eraser, S select, H hand.
 
 use inkcraft::guides;
+use inkcraft::storage::trace;
 use inkcraft::{
     document::Document,
     input::{
@@ -1240,21 +1241,6 @@ fn run_headless(args: &Args) -> Result<(), Box<dyn Error>> {
         println!("exported {}", out.display());
     }
     Ok(())
-}
-
-/// Appends a timestamped line to `startup.log` in the data folder. Used to find where window
-/// startup stops when the process dies without printing anything.
-fn trace(step: &str) {
-    use std::io::Write;
-    let dir = default_data_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("startup.log"))
-    {
-        let _ = writeln!(file, "{} {step}", unix_now());
-    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {

@@ -490,18 +490,23 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new(display: OwnedDisplayHandle, window: Arc<Window>) -> Result<Self, Box<dyn Error>> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
+        // `_from_env` lets WGPU_BACKEND pick a backend (dx12, vulkan, gl) for testing.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(
             Box::new(display),
         ));
+        crate::storage::trace("renderer: instance created");
         let surface = instance.create_surface(window.clone())?;
+        crate::storage::trace("renderer: surface created");
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
             apply_limit_buckets: false,
         }))?;
+        crate::storage::trace("renderer: adapter selected");
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
+        crate::storage::trace("renderer: device created");
 
         let caps = surface.get_capabilities(&adapter);
         // A non-sRGB format keeps sampled colors unchanged on output.
