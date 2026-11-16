@@ -67,9 +67,22 @@ pub fn content_bounds(strokes: &[Stroke], images: &[PageImage]) -> Option<Rect> 
     any.then(|| Rect::new(min, max))
 }
 
+/// Size of `(w, h)` scaled down to fit inside `fit` (`(width, height)`), keeping its shape.
+/// Without a fit, the size is unchanged.
+pub fn fit_size(w: f64, h: f64, fit: Option<(f64, f64)>) -> (f64, f64) {
+    match fit {
+        Some((fw, fh)) if w > 0.0 && h > 0.0 => {
+            let scale = (fw / w).min(fh / h);
+            (w * scale, h * scale)
+        }
+        _ => (w, h),
+    }
+}
+
 /// Renders every page of a PDF into a column starting at `top_y` on the canvas, left-aligned at x = 0.
+/// With `fit`, each page is scaled to fit that size (the artboard) instead of its own size.
 /// Returns one [`PageImage`] per page.
-pub fn import(data: Vec<u8>, top_y: f64) -> Result<Vec<PageImage>, PdfError> {
+pub fn import(data: Vec<u8>, top_y: f64, fit: Option<(f64, f64)>) -> Result<Vec<PageImage>, PdfError> {
     let pdf = Pdf::new(data).map_err(|e| PdfError::Load(format!("{e:?}")))?;
     let cache = RenderCache::new();
     let interpreter = InterpreterSettings::default();
@@ -98,8 +111,7 @@ pub fn import(data: Vec<u8>, top_y: f64) -> Result<Vec<PageImage>, PdfError> {
         )
         .ok_or(PdfError::Encode)?;
         let png = image.encode(None, EncodedImageFormat::PNG, 100).ok_or(PdfError::Encode)?;
-        let w = w as f64;
-        let h = h as f64;
+        let (w, h) = fit_size(w as f64, h as f64, fit);
         pages.push(PageImage {
             rect: Rect::new([0.0, y], [w, y + h]),
             data: png.as_bytes().to_vec(),
@@ -114,51 +126,71 @@ pub fn import(data: Vec<u8>, top_y: f64) -> Result<Vec<PageImage>, PdfError> {
 pub const IMAGE_TEMPLATE_WIDTH: f64 = 595.0;
 
 /// Places a PNG or JPEG file as one template page with its top edge at `top_y`.
+/// Without `fit` it is [`IMAGE_TEMPLATE_WIDTH`] wide; with `fit` it is scaled to fit that size.
 /// The file's bytes are stored as they are; the pixels are decoded on demand.
-pub fn import_image(data: Vec<u8>, top_y: f64) -> Result<PageImage, PdfError> {
+pub fn import_image(data: Vec<u8>, top_y: f64, fit: Option<(f64, f64)>) -> Result<PageImage, PdfError> {
     let decoded = Image::from_encoded(Data::new_copy(&data))
         .ok_or_else(|| PdfError::Load("not a PNG or JPEG image".into()))?;
     let (w, h) = (decoded.width() as f64, decoded.height() as f64);
     if w <= 0.0 || h <= 0.0 {
         return Err(PdfError::Load("the image is empty".into()));
     }
-    let height = IMAGE_TEMPLATE_WIDTH * h / w;
+    let (width, height) = match fit {
+        Some(_) => fit_size(w, h, fit),
+        None => (IMAGE_TEMPLATE_WIDTH, IMAGE_TEMPLATE_WIDTH * h / w),
+    };
     Ok(PageImage {
-        rect: Rect::new([0.0, top_y], [IMAGE_TEMPLATE_WIDTH, top_y + height]),
+        rect: Rect::new([0.0, top_y], [width, top_y + height]),
         data,
     })
 }
 
 /// Imports a file by its extension: PDF pages, or a PNG or JPEG template.
-pub fn import_file(path: &Path, top_y: f64) -> Result<Vec<PageImage>, PdfError> {
+/// `fit` is the artboard size to scale pages to, if there is an artboard.
+pub fn import_file(path: &Path, top_y: f64, fit: Option<(f64, f64)>) -> Result<Vec<PageImage>, PdfError> {
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
     let bytes = std::fs::read(path)?;
     match ext.as_str() {
-        "pdf" => import(bytes, top_y),
-        "png" | "jpg" | "jpeg" => Ok(vec![import_image(bytes, top_y)?]),
+        "pdf" => import(bytes, top_y, fit),
+        "png" | "jpg" | "jpeg" => Ok(vec![import_image(bytes, top_y, fit)?]),
         _ => Err(PdfError::Load(format!("unsupported file type .{ext}"))),
     }
 }
 
-/// Writes the notebook to a PDF at `path`, one PDF page per imported page.
+/// Writes the notebook to a PDF at `path`.
 ///
-/// Strokes are drawn on every page they overlap. Strokes that lie outside all
-/// imported pages go on one extra page. A notebook with no imports is one page.
+/// With an artboard (`sheet`), the first PDF page is exactly the artboard's size.
+/// Imported pages that lie on the artboard are drawn on it; imported pages
+/// elsewhere get a page of their own. Strokes are drawn on every page they
+/// overlap. Strokes outside the artboard and the imports go on one extra page.
+/// Without an artboard, each imported page is one PDF page sized to the content.
 pub fn export(
     path: &Path,
     strokes: &[Stroke],
     images: &[PageImage],
     pattern: Pattern,
+    sheet: Option<Rect>,
 ) -> Result<(), PdfError> {
-    // (region in page units, margin in points)
-    let mut regions: Vec<(Rect, f64)> = images.iter().map(|i| (i.rect, 0.0)).collect();
+    // (region in page units, margin in points); the sheet has no margin.
+    let mut regions: Vec<(Rect, f64)> = Vec::new();
+    if let Some(sheet) = sheet {
+        regions.push((sheet, 0.0));
+    }
+    for image in images {
+        let on_sheet = sheet.is_some_and(|s| s.intersects(&image.rect));
+        if !on_sheet {
+            regions.push((image.rect, 0.0));
+        }
+    }
     let loose: Vec<Rect> = strokes
         .iter()
         .map(Stroke::bounds)
-        .filter(|b| !images.iter().any(|i| i.rect.intersects(b)))
+        .filter(|b| {
+            !images.iter().any(|i| i.rect.intersects(b)) && !sheet.is_some_and(|s| s.intersects(b))
+        })
         .collect();
     if let Some(bounds) = union(&loose) {
         regions.push((bounds, EXPORT_MARGIN));
@@ -255,11 +287,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("inkcraft-pdf-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("roundtrip.pdf");
-        export(&path, &[line((10.0, 10.0), (200.0, 120.0))], &[], Pattern::Blank).unwrap();
+        export(&path, &[line((10.0, 10.0), (200.0, 120.0))], &[], Pattern::Blank, None).unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
         assert!(bytes.starts_with(b"%PDF"));
-        let pages = import(bytes, 0.0).unwrap();
+        let pages = import(bytes, 0.0, None).unwrap();
         assert_eq!(pages.len(), 1);
         let r = pages[0].rect;
         assert!(r.max[0] - r.min[0] > 190.0, "width was {}", r.max[0] - r.min[0]);
@@ -269,6 +301,24 @@ mod tests {
 
     #[test]
     fn rejects_bytes_that_are_not_a_pdf() {
-        assert!(matches!(import(b"hello".to_vec(), 0.0), Err(PdfError::Load(_))));
+        assert!(matches!(import(b"hello".to_vec(), 0.0, None), Err(PdfError::Load(_))));
+    }
+
+    #[test]
+    fn fit_keeps_shape_inside_the_sheet() {
+        assert_eq!(fit_size(1224.0, 792.0, Some((612.0, 792.0))), (612.0, 396.0));
+        assert_eq!(fit_size(300.0, 200.0, None), (300.0, 200.0));
+        assert_eq!(fit_size(100.0, 50.0, Some((612.0, 792.0))), (612.0, 306.0));
+    }
+
+    #[test]
+    fn sheet_is_the_first_exported_page_at_its_exact_size() {
+        let dir = std::env::temp_dir().join(format!("inkcraft-sheet-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sheet.pdf");
+        let sheet = Rect::new([0.0, 0.0], [1008.0, 612.0]);
+        export(&path, &[line((10.0, 10.0), (200.0, 120.0))], &[], Pattern::Blank, Some(sheet)).unwrap();
+        let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+        assert!(text.contains("/MediaBox [0 0 1008 612]"), "{text}");
     }
 }

@@ -737,7 +737,8 @@ impl Session {
             .chain(self.doc.strokes().iter().map(|s| s.bounds().max[1]))
             .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v))));
         let top = bottom.map_or(0.0, |b| b + pdf::PAGE_GAP);
-        let result = pdf::import_file(path, top).map_err(|e| e.to_string());
+        let fit = self.page.map(|p| (p.width, p.height));
+        let result = pdf::import_file(path, top, fit).map_err(|e| e.to_string());
         match result {
             Ok(pages) => {
                 let count = pages.len();
@@ -830,7 +831,8 @@ impl Session {
     fn export_pdf(&mut self) {
         let target = self.path.with_extension("pdf");
         let notebook = self.snapshot();
-        let message = match pdf::export(&target, &notebook.strokes, &notebook.images, notebook.pattern) {
+        let sheet = self.page.map(Page::rect);
+        let message = match pdf::export(&target, &notebook.strokes, &notebook.images, notebook.pattern, sheet) {
             Ok(()) => format!(
                 "Exported {}",
                 target.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()
@@ -1327,7 +1329,8 @@ fn run_headless(args: &Args) -> Result<(), Box<dyn Error>> {
     if let Some(file) = &args.import {
         let top = pdf::content_bounds(&notebook.strokes, &notebook.images)
             .map_or(0.0, |b| b.max[1] + pdf::PAGE_GAP);
-        let pages = pdf::import_file(file, top)?;
+        let fit = notebook.page.map(|p| (p.width, p.height));
+        let pages = pdf::import_file(file, top, fit)?;
         println!("imported {} page(s) from {}", pages.len(), file.display());
         notebook.images.extend(pages);
     }
@@ -1335,7 +1338,7 @@ fn run_headless(args: &Args) -> Result<(), Box<dyn Error>> {
         save_notebook(&args.path, &notebook)?;
     }
     if let Some(out) = &args.export {
-        pdf::export(out, &notebook.strokes, &notebook.images, notebook.pattern)?;
+        pdf::export(out, &notebook.strokes, &notebook.images, notebook.pattern, notebook.page.map(Page::rect))?;
         println!("exported {}", out.display());
     }
     Ok(())

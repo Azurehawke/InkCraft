@@ -241,7 +241,11 @@ unbounded canvas.
 Rulers are measured in inches. Coordinates are still stored in points (72 per
 inch). Command line: `--page letter`, `--page legal,landscape` or `--page tabloid`.
 
-Not yet done: PDF export still uses the imported pages' sizes, not the artboard.
+PDF export: with an artboard, the first PDF page is exactly the artboard size.
+Imported pages on the sheet are drawn on it, and other imports and strokes get
+their own pages. Import: PDF pages and PNG/JPG templates are scaled to fit the
+artboard, keeping their shape, so they land on the sheet. Without an artboard,
+imports keep their own size.
 
 Limits:
 
